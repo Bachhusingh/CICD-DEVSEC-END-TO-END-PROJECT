@@ -1,0 +1,231 @@
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: devsecops-aws-variables
+
+  - name: AWS_REGION
+    value: ap-south-1
+
+  - name: ECR_REPOSITORY
+    value: devsecops-app
+
+  - name: EKS_CLUSTER_NAME
+    value: devsecops-cluster
+
+  - name: PROJECT_ROOT
+    value: CICD-DEVSEC-AWS
+
+  - name: IMAGE_TAG
+    value: $(Build.BuildId)
+
+stages:
+
+# STAGE 1: SAST SCAN
+- stage: SAST
+  displayName: Static Application Security Testing
+
+  jobs:
+  - job: BanditScan
+    displayName: Bandit Security Scan
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install bandit
+      displayName: Install Bandit
+
+    - script: |
+        bandit -r $(PROJECT_ROOT)/app/ \
+          -f json -o $(Build.ArtifactStagingDirectory)/bandit-report.json || true
+
+        bandit -r $(PROJECT_ROOT)/app/ -ll -ii
+      displayName: Run Bandit SAST Scan
+
+    - task: PublishBuildArtifacts@1
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'bandit-report'
+        publishLocation: Container
+
+
+# STAGE 2: DEPENDENCY SCAN
+- stage: DependencyScan
+  displayName: Dependency Vulnerability Scan
+
+  dependsOn: SAST
+
+  jobs:
+  - job: SafetyScan
+    displayName: Dependency Scan
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install pip-audit
+        pip-audit -r $(PROJECT_ROOT)/app/requirements.txt
+      displayName: Scan Python Dependencies
+
+
+# STAGE 3: BUILD, TRIVY SCAN AND PUSH TO ECR
+- stage: BuildScanPush
+  displayName: Docker Build, Trivy Scan and ECR Push
+
+  dependsOn: DependencyScan
+
+  jobs:
+  - job: DockerBuild
+    displayName: Build and Push Docker Image
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - script: |
+        aws --version
+        aws sts get-caller-identity
+      displayName: Verify AWS Credentials
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+
+    - script: |
+        ECR_REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+
+        aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin $ECR_REGISTRY
+
+        echo "##vso[task.setvariable variable=ECR_REGISTRY]$ECR_REGISTRY"
+      displayName: Login to Amazon ECR
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+
+    - script: |
+        docker build \
+          -t $(ECR_REGISTRY)/$(ECR_REPOSITORY):$(IMAGE_TAG) \
+          $(PROJECT_ROOT)/app
+      displayName: Build Docker Image
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y curl
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+          sudo sh -s -- -b /usr/local/bin
+
+        trivy image \
+          --severity HIGH,CRITICAL \
+          --ignore-unfixed \
+          --exit-code 1 \
+          $(ECR_REGISTRY)/$(ECR_REPOSITORY):$(IMAGE_TAG)
+      displayName: Trivy Container Security Scan
+
+    - script: |
+        docker push $(ECR_REGISTRY)/$(ECR_REPOSITORY):$(IMAGE_TAG)
+
+        docker tag \
+          $(ECR_REGISTRY)/$(ECR_REPOSITORY):$(IMAGE_TAG) \
+          $(ECR_REGISTRY)/$(ECR_REPOSITORY):latest
+
+        docker push $(ECR_REGISTRY)/$(ECR_REPOSITORY):latest
+      displayName: Push Image to ECR
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+
+
+# STAGE 4: DEPLOY TO EKS
+- stage: DeployToEKS
+  displayName: Deploy Application to EKS
+
+  dependsOn: BuildScanPush
+
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+  jobs:
+  - job: HelmDeploy
+    displayName: Helm Deployment
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - script: |
+        aws eks update-kubeconfig \
+          --region $(AWS_REGION) \
+          --name $(EKS_CLUSTER_NAME)
+
+        kubectl get nodes
+      displayName: Connect to EKS
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+
+    - task: HelmInstaller@1
+      inputs:
+        helmVersionToInstall: 'latest'
+
+    - script: |
+        ECR_REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+
+        helm lint $(PROJECT_ROOT)/helm/devsecops-app
+
+        helm upgrade --install devsecops-app \
+          $(PROJECT_ROOT)/helm/devsecops-app \
+          --namespace devsecops \
+          --create-namespace \
+          --set image.repository=$ECR_REGISTRY/$(ECR_REPOSITORY) \
+          --set image.tag=$(IMAGE_TAG) \
+          --wait \
+          --timeout 5m
+      displayName: Deploy Using Helm
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+
+    - script: |
+        kubectl rollout status deployment/devsecops-app -n devsecops
+        kubectl get pods -n devsecops
+        kubectl get services -n devsecops
+      displayName: Verify Deployment
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
